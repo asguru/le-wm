@@ -1,0 +1,68 @@
+version: v2
+description: le-wm dataloader __getitem__ profiling run (H.264, short-lived diagnostic)
+budget: ai2/robotics
+tasks:
+- name: train
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=torchcodec
+    export STABLEWM_HOME=/weka/robots/aguru/le-wm/.runs
+
+    # Diagnostic copy of train_tamp_full.yaml. Identical pipeline (H.264 dataset, bs=256,
+    # 16 workers) EXCEPT:
+    #   - SWM_PROFILE_GETITEM=1 : swm_patches logs per-sample decode-vs-transform timing
+    #   - subdir=tamp_full_profile : separate run_dir + wandb run so it does NOT clobber the
+    #                                live training run (subdir=tamp_full). Safe to run alongside.
+    uv run --frozen --no-sync train.py \
+      data=tamp_full_h264 \
+      trainer.devices=1 \
+      subdir=tamp_full_profile \
+      num_workers=16 \
+      loader.batch_size=256 \
+      loader.prefetch_factor=4 \
+      optimizer.lr=1e-4 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-tamp
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: SWM_PROFILE_GETITEM   # enable per-sample decode/transform profiler in swm_patches
+    value: "1"
+  - name: SWM_PROFILE_EVERY     # log a windowed average every N samples per worker
+    value: "500"
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 1
+    sharedMemory: 128GiB
+  context:
+    priority: urgent
+    preemptible: false
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true

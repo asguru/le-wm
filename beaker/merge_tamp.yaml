@@ -1,0 +1,52 @@
+version: v2
+description: merge TAMP unmerged LeRobot folders into one dataset (CPU)
+budget: ai2/robotics
+tasks:
+- name: merge
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=pyav
+
+    UNMERGED=/weka/robots/jasonl/TAMP/datasets/unmerged/may28_topdown_flip_norand_3b
+    STAGING=/weka/robots/aguru/le-wm/.data/merge_staging
+    MERGED=/weka/robots/aguru/datasets/tamp_may28_topdown_flip_norand_3b_merged
+
+    # Both splits, training camera ONLY. aggregate COPIES every video stream it stages, so
+    # restricting to observation.images.front_camera (the key train.py reads as `pixels`) keeps
+    # the merge ≈6x smaller/faster than copying all 6 camera/depth streams. To merge every
+    # stream instead, drop the trailing arg.
+    uv run --frozen --no-sync python scripts/merge_tamp_dataset.py \
+      "$UNMERGED" "$STAGING" "$MERGED" blocks_success,blocks_failure observation.images.front_camera
+
+    echo "=== merged dataset info ==="
+    cat "$MERGED/meta/info.json" | python -c "import json,sys; d=json.load(sys.stdin); print('episodes:', d['total_episodes'], 'frames:', d['total_frames'])"
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  envVars:
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  resources:
+    gpuCount: 0
+    memory: 256GiB
+    sharedMemory: 64GiB
+  context:
+    priority: urgent
+    preemptible: false   # aggregate is not resumable; don't let a multi-hour merge get killed
+  constraints:
+    cluster: [ai2/neptune]
+  hostNetworking: true

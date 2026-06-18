@@ -1,0 +1,36 @@
+# le-wm is a flat scripts repo (train.py/eval.py import sibling modules directly),
+# NOT an installable package. This pyproject exists only so `uv run` manages a
+# reproducible environment + lockfile. See `[tool.uv] package = false` below.
+[project]
+name = "le-wm"
+version = "0.1.0"
+description = "LeWorldModel (LeWM) training — local environment pinning"
+# 3.12 is REQUIRED: stable-worldmodel's `lerobot` extra is gated behind
+# `python_version >= '3.12'`. On 3.10/3.11 the LeRobot adapter is silently dropped.
+requires-python = ">=3.12"
+dependencies = [
+    # Training stack only. `train` -> transformers, stable-pretraining, hydra, wandb.
+    # `lerobot` -> lerobot>=0.5.0 (the LeRobot dataset adapter used by load_dataset).
+    # NOT including `env` (MuJoCo/gym sim) — that's only for the closed-loop eval in eval.py.
+    "stable-worldmodel[train,lerobot]",
+    # Listed explicitly (even though transitive) so the cu128 [tool.uv.sources] pin
+    # below actually applies — uv only honors source pins for DIRECT dependencies.
+    "torch",
+    "torchvision",
+]
+
+[tool.uv]
+# Virtual project: uv manages deps + venv but does NOT try to build/install le-wm
+# itself (there's no package to build — modules are run from the repo root).
+package = false
+
+# Pin torch/torchvision to the cluster's CUDA 12.8 wheels (matches the existing
+# cluster torch 2.7.1+cu128). To switch CUDA, change cu128 -> cuXXX in the URL below.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }

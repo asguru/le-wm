@@ -1,0 +1,41 @@
+# TAMP franka world-model data (LeRobot v3.0), read live via stable-worldmodel's
+# LeRobotAdapter. Select with: `uv run train.py data=tamp ...`
+#
+# This config maps LeRobot native keys -> swm names via the adapter's alias map:
+#   primary_camera_key            -> pixels   (REQUIRED: data has 6 camera streams,
+#                                              so the default single-camera auto-pick
+#                                              does NOT fire — must be set explicitly)
+#   action                        -> action   (default alias)
+#   observation.state             -> proprio  (default alias)
+# `state` is intentionally omitted: nothing maps to it by default, and training never
+# uses it (it's only for the closed-loop MPC eval in eval.py, which needs a sim env).
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4  (num_preds=1 + history_size=3)
+  frameskip: 5                                           # 25 fps -> 5 fps effective; window spans 20 raw frames
+
+  # `lerobot://` triggers the LeRobot adapter; the part after :// is just a label
+  # because `root` below points at real local files (no Hub fetch).
+  name: "lerobot://tamp-may28-topdown-flip-3b"
+  root: /weka/robots/aguru/le-wm/.data/tamp_smoke/blocks_success
+  # ^ SMOKE-TEST: one problem's success split (71 episodes), schema-fixed for lerobot>=0.5
+  #   by scripts/fix_lerobot_video_index.py (backfills videos/<key>/chunk_index|file_index;
+  #   data/ + videos/ are symlinks to jasonl's originals). The raw source is:
+  #   /weka/robots/jasonl/TAMP/datasets/unmerged/may28_topdown_flip_norand_3b/problem_letter-color-10-20260528_182336_077661_5788/blocks_success
+  #   For a full run, apply the same backfill while merging the ~250 problem_*/blocks_success dirs.
+
+  primary_camera_key: observation.images.front_camera     # which stream becomes `pixels`
+
+  # keys_to_load / keys_to_cache use the ALIASED names, not native LeRobot keys.
+  # train.py z-score-normalizes every non-pixels key here, so each must resolve via the
+  # alias map above. Drop `proprio` if you want the leanest possible run (loss ignores it).
+  keys_to_load:  [pixels, action, proprio]
+  keys_to_cache: [action, proprio]
+
+  # --- options you may want later ---
+  # Use a cleaner action space than the default combined 9-d `action`
+  # (joint_0..6 + gripper + hard_config). e.g. 7-d joint targets:
+  # key_aliases: { action.joint_position: action }   # NOTE: collides with the default
+  #   action->action alias; if you use this, confirm the adapter's precedence first.
+  #
+  # Add a privileged `state` column (only meaningful once TAMP is wrapped as an swm env):
+  # key_aliases: { observation.state.object_pose.block_red1: state }

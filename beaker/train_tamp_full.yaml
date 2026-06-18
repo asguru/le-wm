@@ -1,0 +1,78 @@
+version: v2
+description: le-wm LeWM full train on merged TAMP dataset (1 GPU, wandb)
+budget: ai2/robotics
+tasks:
+- name: train
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=torchcodec   # AV1-encoded videos: torchcodec (ffmpeg/dav1d) >> pyav for decode throughput
+    # Persist checkpoints to weka so they survive the job. STABLEWM_HOME covers swm's
+    # SaveCkptCallback (weights-only .pt); SPT_CACHE_DIR covers stable-pretraining's full
+    # resumable checkpoints (last.ckpt with optimizer/scheduler state) — without it those
+    # default to ephemeral ~/.cache and are LOST when the job ends.
+    export STABLEWM_HOME=/weka/robots/aguru/le-wm/.runs
+    export SPT_CACHE_DIR=/weka/robots/aguru/le-wm/.runs/spt
+
+    # Full run: default 100 epochs, single GPU, wandb on. `subdir` is FIXED (not the hydra
+    # job id) so a re-launch resumes from STABLEWM_HOME/checkpoints/tamp_full instead of
+    # starting over. Set wandb.config.entity/project to your wandb workspace.
+    # Throughput tuning:
+    #   data=tamp_full_h264 : videos re-encoded AV1->H.264 (codec only) -> ~4-5x faster decode,
+    #                         removes the dataloader bottleneck that pinned us at 0.6 it/s.
+    #   num_workers 16      : H.264 decode is cheap, so back to the default 24-CPU share (schedulable;
+    #                         the cpuCount=32 / 48 attempts wouldn't schedule).
+    #   loader.batch_size 128->256 : use GPU memory headroom (~18M params, ~10GB@128)
+    #   optimizer.lr 5e-5->1e-4     : linear LR scaling for the 2x batch
+    uv run --frozen --no-sync train.py \
+      data=tamp_full_h264 \
+      trainer.devices=1 \
+      subdir=tamp_full \
+      output_model_name=lewm_tamp_full \
+      num_workers=16 \
+      loader.batch_size=256 \
+      loader.prefetch_factor=4 \
+      optimizer.lr=1e-4 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-tamp
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: PYTHONUNBUFFERED   # stream stdout live (setup logging + wandb banners) so a hang is locatable
+    value: "1"
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  # wandb auth: env var must be WANDB_API_KEY (what wandb reads); `secret:` is the
+  # per-user beaker secret name in ai2/robots-rl. NOTE: a generic `WANDB_API_KEY` secret
+  # also exists in this workspace (another user's) — point at the namespaced one.
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 1
+    sharedMemory: 128GiB
+  context:
+    priority: urgent
+    preemptible: false   # multi-hour run; checkpoint-resume not yet verified, so don't preempt
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true

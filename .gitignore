@@ -1,0 +1,15 @@
+# Training artifacts
+.data/
+.runs/
+outputs/
+wandb/
+wandb_resume.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Claude context / transcript dumps
+.claude/
+*-i-launched-a-training-run-recently-with-beakertr.txt

@@ -1,0 +1,14 @@
+# Full merged TAMP dataset, videos re-encoded AV1 -> H.264 with GOP=1 (all-intra; resolution
+# 640x360 / 25fps / frame count preserved exactly — see scripts/transcode_av1_to_h264.sh).
+# GOP=1 makes every frame independently seekable, so torchcodec decodes only the 4 requested
+# frames per sample (~3ms) instead of a long run from a distant keyframe (~47ms on GOP-15 over
+# these 80-min files). data/ + meta/ are identical to the AV1 dataset, so frame indexing is
+# unchanged. Select with: `uv run train.py data=tamp_full_h264_g1 ...`
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4
+  frameskip: 5
+  name: "lerobot://tamp-may28-topdown-flip-3b-merged"
+  root: /weka/robots/aguru/datasets/tamp_may28_topdown_flip_norand_3b_merged_h264_g1
+  primary_camera_key: observation.images.front_camera
+  keys_to_load:  [pixels, action, proprio]
+  keys_to_cache: [action, proprio]

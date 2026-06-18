@@ -1,0 +1,73 @@
+version: v2
+description: le-wm LeWM smoke train on TAMP LeRobot data (1 GPU, uv)
+budget: ai2/robotics
+tasks:
+- name: train-smoke
+  replicas: 1
+  # Base image only needs the NVIDIA driver (host-provided) + curl; torch cu128 wheels
+  # bundle the CUDA runtime, and PyAV bundles ffmpeg — so uv builds the whole env itself.
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+
+    # uv: use the image's copy if present, else install to ~/.local/bin
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # Keep the venv + wheel cache on fast LOCAL disk, never on weka (slow imports / write contention)
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+
+    cd /weka/robots/aguru/le-wm
+
+    # Build the locked env (CPython 3.12 managed by uv, torch 2.10.0+cu128, lerobot 0.5.1, ...)
+    uv sync --frozen
+
+    # Schema-fix the LeRobot data for lerobot>=0.5 (idempotent): the TAMP recorder wrote
+    # episodes without videos/<key>/chunk_index|file_index columns. This regenerates a fixed
+    # root (symlinks data/+videos/ from jasonl's originals, patches a copied meta/) so the job
+    # is self-contained and doesn't depend on a hand-made dir. tamp.yaml's `root:` points here.
+    SRC=/weka/robots/jasonl/TAMP/datasets/unmerged/may28_topdown_flip_norand_3b/problem_letter-color-10-20260528_182336_077661_5788/blocks_success
+    DST=/weka/robots/aguru/le-wm/.data/tamp_smoke/blocks_success
+    uv run --frozen --no-sync python scripts/fix_lerobot_video_index.py "$SRC" "$DST"
+
+    # Runtime env for the smoke run
+    export HF_HUB_OFFLINE=1            # data is local via `root:` — don't phone the Hub
+    export LEROBOT_VIDEO_BACKEND=pyav  # PyAV is self-contained (no system ffmpeg needed)
+    export STABLEWM_HOME=/results      # checkpoints / run config land in the beaker result
+
+    # 1 epoch, a handful of batches — just proves the stack: uv env -> LeRobot adapter
+    # -> video decode -> JEPA forward/backward on a single GPU.
+    uv run --frozen --no-sync train.py \
+      data=tamp \
+      trainer.devices=1 \
+      trainer.max_epochs=1 \
+      +trainer.limit_train_batches=5 \
+      +trainer.limit_val_batches=2 \
+      wandb.enabled=false
+  datasets:
+  # Both the le-wm code and the TAMP dataset live under /weka/robots (fileset robots-default).
+  # NOTE: verify this source name with `beaker dataset list`-style tooling if the mount fails.
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  resources:
+    gpuCount: 1
+    sharedMemory: 64GiB
+  context:
+    priority: urgent
+    preemptible: true
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true

@@ -1,0 +1,13 @@
+# Full merged TAMP dataset, but with videos re-encoded AV1 -> H.264 (codec only; resolution
+# 640x360 / 25fps / frame count preserved exactly — see scripts/transcode_av1_to_h264.sh).
+# AV1 decode on CPU was the dataloader bottleneck (H100 has no AV1 hw decoder); H.264 decodes
+# ~4-5x faster on CPU and is NVDEC-eligible. data/ + meta/ are identical to the AV1 dataset,
+# so frame indexing is unchanged. Select with: `uv run train.py data=tamp_full_h264 ...`
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4
+  frameskip: 5
+  name: "lerobot://tamp-may28-topdown-flip-3b-merged"
+  root: /weka/robots/aguru/datasets/tamp_may28_topdown_flip_norand_3b_merged_h264
+  primary_camera_key: observation.images.front_camera
+  keys_to_load:  [pixels, action, proprio]
+  keys_to_cache: [action, proprio]

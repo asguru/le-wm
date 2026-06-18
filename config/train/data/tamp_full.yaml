@@ -1,0 +1,12 @@
+# Full merged TAMP dataset (all problem_*/blocks_{success,failure}), built by
+# scripts/merge_tamp_dataset.py via lerobot aggregate_datasets. Unlike the smoke root,
+# this is a single natively-correct v3.0 dataset (no symlink/patch tricks), so it loads
+# directly. Select with: `uv run train.py data=tamp_full ...`
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4
+  frameskip: 5
+  name: "lerobot://tamp-may28-topdown-flip-3b-merged"
+  root: /weka/robots/aguru/datasets/tamp_may28_topdown_flip_norand_3b_merged
+  primary_camera_key: observation.images.front_camera
+  keys_to_load:  [pixels, action, proprio]
+  keys_to_cache: [action, proprio]

@@ -1,4 +1,7 @@
+import logging
 import os
+import time
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -10,8 +13,22 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+import swm_patches  # noqa: F401  # vectorizes LeRobotAdapter._build_episode_metadata (swm 0.1.1 hang fix)
 from module import SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+
+log = logging.getLogger("train.setup")
+
+
+@contextmanager
+def step(name):
+    """Log entry/exit + wall time for a setup step so a silent hang is locatable."""
+    log.info("[setup] >>> %s ...", name)
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        log.info("[setup] <<< %s done in %.1fs", name, time.perf_counter() - t0)
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -53,36 +70,43 @@ def run(cfg):
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
-    dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
-    )
+    with step(f"load_dataset({dataset_name})"):
+        dataset = swm.data.load_dataset(
+            dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
+        )
+    log.info("[setup] dataset loaded: %d samples", len(dataset))
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
+
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
-            normalizer = get_column_normalizer(dataset, col, col)
+            with step(f"get_column_normalizer({col})"):
+                normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
 
-        cfg.model.action_encoder.input_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
+        with step("get_dim(action)"):
+            cfg.model.action_encoder.input_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
 
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
-    )
+    with step("random_split + build DataLoaders"):
+        rnd_gen = torch.Generator().manual_seed(cfg.seed)
+        train_set, val_set = spt.data.random_split(
+            dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+        train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
+        val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    log.info("[setup] train=%d val=%d samples", len(train_set), len(val_set))
     
     ##############################
     ##       model / optim      ##
     ##############################
 
-    world_model = hydra.utils.instantiate(cfg.model)
+    with step("instantiate model"):
+        world_model = hydra.utils.instantiate(cfg.model)
 
     optimizers = {
         'model_opt': {
@@ -110,9 +134,12 @@ def run(cfg):
 
     logger = None
     if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+        with step("WandbLogger init"):
+            logger = WandbLogger(**cfg.wandb.config)
+        with step("wandb log_hyperparams"):
+            logger.log_hyperparams(OmegaConf.to_container(cfg))
 
+    log.info("[setup] run_dir=%s", run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
@@ -121,13 +148,14 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
-    trainer = pl.Trainer(
-        **cfg.trainer,
-        callbacks=[object_dump_callback],
-        num_sanity_val_steps=1,
-        logger=logger,
-        enable_checkpointing=True,
-    )
+    with step("build Trainer"):
+        trainer = pl.Trainer(
+            **cfg.trainer,
+            callbacks=[object_dump_callback],
+            num_sanity_val_steps=1,
+            logger=logger,
+            enable_checkpointing=True,
+        )
 
     ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
     manager = spt.Manager(
@@ -137,7 +165,9 @@ def run(cfg):
         ckpt_path=ckpt_path if ckpt_path.exists() else None,
     )
 
+    log.info("[setup] entering manager()/trainer.fit — first training step should follow")
     manager()
+    log.info("[setup] manager() returned (training complete)")
     return
 
 
