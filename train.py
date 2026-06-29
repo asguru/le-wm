@@ -15,7 +15,14 @@ from omegaconf import OmegaConf, open_dict
 
 import swm_patches  # noqa: F401  # vectorizes LeRobotAdapter._build_episode_metadata (swm 0.1.1 hang fix)
 from module import SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+from utils import (
+    episode_split,
+    get_column_normalizer,
+    get_img_preprocessor,
+    RowIndexDataset,
+    SaveCkptCallback,
+)
+from wm_error_logging import WMErrorVideoCallback
 
 log = logging.getLogger("train.setup")
 
@@ -55,10 +62,20 @@ def lejepa_forward(self, batch, stage, cfg):
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
+
+    # Per-sample latent prediction error (the un-aggregated version of pred_loss, NOT a new
+    # logged metric) — buffered for WMErrorVideoCallback to build the per-window error map.
+    # Keyed by dataset row_id so it can be realigned to (episode, step) under DDP sharding.
+    # NB: spt.Module.validation_step calls forward(batch, stage="validate") (not "val").
+    if stage == "validate" and "row_id" in batch:
+        err = (pred_emb - tgt_emb).pow(2).mean(dim=(1, 2)).detach().cpu()  # (B,)
+        if not hasattr(self, "_wm_err_buf"):
+            self._wm_err_buf = []
+        self._wm_err_buf.append((batch["row_id"].detach().cpu(), err))
     return output
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
@@ -91,11 +108,16 @@ def run(cfg):
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
 
-    with step("random_split + build DataLoaders"):
+    with step("episode_split + build DataLoaders"):
         rnd_gen = torch.Generator().manual_seed(cfg.seed)
-        train_set, val_set = spt.data.random_split(
-            dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        # Split by whole episodes (videos), not random rows, so the val set is contiguous
+        # video — a prerequisite for the world-model-error sliding-window analysis below.
+        train_rows, val_rows, row_ep, row_step = episode_split(
+            dataset, cfg.train_split, cfg.seed
         )
+        train_set = torch.utils.data.Subset(dataset, train_rows.tolist())
+        # val carries row_id per sample (shuffle=False keeps episodes in temporal order).
+        val_set = RowIndexDataset(dataset, val_rows)
 
         train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
         val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
@@ -148,10 +170,24 @@ def run(cfg):
         run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
     )
 
+    callbacks = [object_dump_callback]
+    wm_err_cfg = OmegaConf.to_container(cfg.get("wm_error_logging", {}) or {}, resolve=True)
+    if wm_err_cfg.get("enabled", False):
+        callbacks.append(
+            WMErrorVideoCallback(
+                dataset=dataset,
+                val_rows=val_rows,
+                ep=row_ep,
+                step=row_step,
+                **{k: v for k, v in wm_err_cfg.items() if k != "enabled"},
+                enabled=True,
+            )
+        )
+
     with step("build Trainer"):
         trainer = pl.Trainer(
             **cfg.trainer,
-            callbacks=[object_dump_callback],
+            callbacks=callbacks,
             num_sanity_val_steps=1,
             logger=logger,
             enable_checkpointing=True,

@@ -17,6 +17,11 @@ tasks:
     export UV_CACHE_DIR=/root/uv-cache
     cd /weka/robots/aguru/le-wm
     uv sync --frozen
+    # WMErrorVideoCallback logs wandb.Video clips at each validation; wandb.Video(numpy)
+    # needs moviepy to encode mp4s. It's NOT in the locked deps, so add it to the env (pinned
+    # <2 for wandb 0.24's moviepy.editor import). Without it the callback silently falls back
+    # to logging only the error histograms (no video panels).
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg
 
     export HF_HUB_OFFLINE=1
     export LEROBOT_VIDEO_BACKEND=torchcodec   # AV1-encoded videos: torchcodec (ffmpeg/dav1d) >> pyav for decode throughput
@@ -37,9 +42,15 @@ tasks:
     #                         the cpuCount=32 / 48 attempts wouldn't schedule).
     #   loader.batch_size 128->256 : use GPU memory headroom (~18M params, ~10GB@128)
     #   optimizer.lr 5e-5->1e-4     : linear LR scaling for the 2x batch
+    #   val_check_interval=0.34    : validate ~3x/epoch (and log WM-error videos each time).
+    #                         Expressed as a FRACTION of an epoch on purpose: an INT is
+    #                         "every N batches" and must be <= batches/epoch, but batches/epoch
+    #                         is PER-RANK and shrinks with more GPUs (6.3M/(256*8)≈3075 at 8 GPUs,
+    #                         so an int like 8000 would crash). The fraction is GPU-count-agnostic.
     uv run --frozen --no-sync train.py \
       data=tamp_full_h264 \
       trainer.devices=1 \
+      +trainer.val_check_interval=0.34 \
       subdir=tamp_full \
       output_model_name=lewm_tamp_full \
       num_workers=16 \

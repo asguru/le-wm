@@ -1,0 +1,87 @@
+version: v2
+description: le-wm LeWM full train on merged TAMP dataset (8 GPU / full node, DDP, wandb)
+budget: ai2/robotics
+tasks:
+- name: train-8gpu
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+    # WMErrorVideoCallback logs wandb.Video clips at each validation; wandb.Video(numpy) needs
+    # moviepy to encode mp4s. NOT in the locked deps, so add it (pinned <2 for wandb 0.24's
+    # moviepy.editor import). Without it the callback silently falls back to histograms only.
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=torchcodec   # AV1/H.264: torchcodec (ffmpeg/dav1d) >> pyav for decode
+    # Persist checkpoints to weka so they survive the job (see 1-GPU spec for details).
+    export STABLEWM_HOME=/weka/robots/aguru/le-wm/.runs
+    export SPT_CACHE_DIR=/weka/robots/aguru/le-wm/.runs/spt
+
+    # ── 8-GPU (full node) DDP run ──────────────────────────────────────────────────────
+    # trainer.devices=8         : Lightning auto-selects DDP (manual_backward all-reduces grads).
+    #                             Rank-0-guarded checkpointing; WM-error callback all-gathers +
+    #                             dedups by row_id, so val sharding is handled.
+    # loader.batch_size=1024    : PER-GPU batch. Effective batch = 1024 * 8 = 8192 = 32x the old
+    #                             1-GPU effective batch of 256 (requested). The 1-GPU run sat at
+    #                             <20% GPU mem at bs=256, so 4x per-GPU (->~<80%) should fit.
+    #                             NOTE: spt uses MANUAL optimization, so Trainer.accumulate_grad_batches
+    #                             is ignored — if 1024 OOMs you must lower batch_size (which lowers
+    #                             the effective batch), not rely on grad accumulation.
+    # optimizer.lr=5.6e-4       : sqrt-scaled from 1e-4@256 for the 32x batch (sqrt(32)≈5.66). Safer
+    #                             than linear (3.2e-3) for AdamW; the scheduler's warmup helps. Tune.
+    # num_workers=8, prefetch=2 : 8 ranks SHARE the node's /dev/shm. In-flight batches per rank =
+    #                             workers*prefetch=16, each ~2.5GB (bs1024 pixels f32) ≈ 40GB/rank
+    #                             ≈ 315GB across 8 ranks -> needs the large sharedMemory below.
+    # val_check_interval=0.34   : ~3x/epoch as a FRACTION (GPU-count-agnostic; an int would have to
+    #                             be <= per-rank batches/epoch, which shrinks with more GPUs).
+    # subdir=tamp_full_8gpu     : FRESH run id (does NOT resume the 1-GPU tamp_full checkpoint).
+    uv run --frozen --no-sync train.py \
+      data=tamp_full_h264 \
+      trainer.devices=8 \
+      +trainer.val_check_interval=0.34 \
+      subdir=tamp_full_8gpu \
+      output_model_name=lewm_tamp_full_8gpu \
+      num_workers=8 \
+      loader.batch_size=1024 \
+      loader.prefetch_factor=2 \
+      optimizer.lr=5.6e-4 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-tamp
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 8
+    # 8 DDP ranks share the node's /dev/shm; bs=1024 pixel batches are ~2.5GB and
+    # workers*prefetch=16 are in flight per rank (~315GB worst case). 512GiB leaves headroom.
+    sharedMemory: 512GiB
+  context:
+    priority: urgent
+    preemptible: false   # multi-hour run; don't preempt
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true

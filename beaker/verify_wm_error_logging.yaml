@@ -1,0 +1,90 @@
+version: v2
+description: le-wm — verify world-model-error video logging (reduced TAMP smoke data, multi-epoch, wandb)
+budget: ai2/robotics
+tasks:
+- name: verify-wm-error
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # venv + wheel cache on fast LOCAL disk (never weka)
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+
+    cd /weka/robots/aguru/le-wm
+
+    # Build the locked env, then add moviepy: wandb.Video(numpy_array) needs it to encode
+    # mp4s. It is NOT in the locked deps, so install it into the same env after sync. Pinned
+    # <2 because wandb 0.24's video path imports the moviepy<2 API (`moviepy.editor`).
+    uv sync --frozen
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg
+
+    # NOTE: the old `data=tamp` smoke root symlinked jasonl's unmerged originals, which have
+    # since been deleted (dead symlinks). Instead we use the self-contained MERGED H.264
+    # dataset and load only a small `data.dataset.episodes` subset, so it's still quick.
+
+    export HF_HUB_OFFLINE=1            # data is local via `root:` — don't phone the Hub
+    export LEROBOT_VIDEO_BACKEND=pyav  # PyAV bundles ffmpeg (no system ffmpeg needed)
+    export STABLEWM_HOME=/results      # throwaway checkpoints land in the beaker result
+    export PYTHONUNBUFFERED=1
+
+    # Reduced-data verification of wm_error_logging.WMErrorVideoCallback:
+    #   data=tamp_full_h264 + episodes=[0..59] -> only 60 episodes of the merged H.264 set
+    #                                load (~54 train / ~6 val episodes after the episode split).
+    #   max_epochs=4              -> validation runs every epoch => 4 eval intervals. The
+    #                                "change vs previous interval" section needs a previous
+    #                                interval, so it logs on intervals 2,3,4 (progression).
+    #   limit_train_batches=10    -> short epochs, but the model still updates each epoch so
+    #                                per-window error actually changes between intervals.
+    #   NO limit_val_batches      -> the FULL val set is evaluated each interval, so sliding
+    #                                windows are complete (a partial val pass would skip them).
+    #   window_size=8, num_videos=5 -> smaller/faster for the smoke (ensures enough windows
+    #                                form on the few val episodes).
+    #   wandb on (entity=prior-ai2) -> view validate/wm_error/{high,low}/* and
+    #                                validate/wm_error_change/{most_reduced,least_reduced}/*.
+    uv run --frozen --no-sync train.py \
+      data=tamp_full_h264 \
+      '+data.dataset.episodes=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59]' \
+      trainer.devices=1 \
+      trainer.max_epochs=2 \
+      +trainer.limit_train_batches=10 \
+      subdir=wm_error_smoke_fix2 \
+      output_model_name=lewm_wm_error_smoke_fix2 \
+      num_workers=4 \
+      loader.batch_size=64 \
+      wm_error_logging.window_size=8 \
+      wm_error_logging.num_videos=5 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-wm-error-smoke
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  # wandb auth: secret lives in the ai2/robots-rl workspace — launch this experiment there.
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 1
+    sharedMemory: 64GiB
+  context:
+    priority: urgent
+    preemptible: true   # short verification job; fine to preempt/rerun
+  constraints:
+    cluster: [ai2/jupiter, ai2/ceres]
+  hostNetworking: true

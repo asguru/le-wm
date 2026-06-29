@@ -41,3 +41,16 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+# World-model prediction-error video logging on the val set (validation/eval only).
+# Tiles non-overlapping windows of `window_size` consecutive data points over each val
+# episode, accumulates per-sample latent prediction error per window, and logs videos of
+# the worst/best windows to wandb each eval interval. See wm_error_logging.py.
+wm_error_logging:
+  enabled: true
+  window_size: 16
+  stride: 16                 # non-overlapping; set < window_size for an overlapping slide
+  num_videos: 10             # per bucket (high-error and low-error)
+  fps: 4
+  eval_every_n_epochs: null  # null = run on every validation epoch
+  frame_select: first        # which frame of each data point to show (first|last)
