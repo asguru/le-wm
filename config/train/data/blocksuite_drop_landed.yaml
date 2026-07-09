@@ -1,0 +1,23 @@
+# Blocksuite-Drop-v0 (the _1782837706 variant) — same as blocksuite_drop.yaml but this build
+# adds a per-timestep `landed` bool ([1]) that flips True when the dropped block lands. We load
+# it so the validation WM-error logging can split per-sample metrics by "block fallen vs not"
+# (see wm_error_logging.py landed histograms). Reader-compatible root built by
+# scripts/fix_blocksuite_dataset.py. Select with: `uv run train.py data=blocksuite_drop_landed ...`
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4
+  frameskip: 5
+  name: "lerobot://blocksuite-drop-v0-landed"
+  root: /weka/robots/aguru/datasets/blocksuite_drop_landed_fixed
+  primary_camera_key: "observation.images.camera:drop_camera"
+  # No canonical `action` (9-dim policy action is `action.policy`); `landed` is a native bool
+  # column with no default alias, so map it to itself so it can be loaded. proprio =
+  # observation.state[8] is a default alias.
+  # block_pose ([7]: x,y,z,qw,qx,qy,qz) is a native column with no default alias, so (like
+  # `landed`) map it to a clean batch key to load it. It feeds the validation linear probe
+  # (probe_logging.py): latent -> z / quaternion decodability.
+  key_aliases:
+    "action.policy": action
+    landed: landed
+    "observation.state.object_pose.block": block_pose
+  keys_to_load:  [pixels, action, proprio, landed, block_pose]
+  keys_to_cache: [action, proprio, landed, block_pose]

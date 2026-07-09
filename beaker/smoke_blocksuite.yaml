@@ -1,0 +1,65 @@
+version: v2
+description: le-wm — smoke-test the fixed Blocksuite-Drop-v0 dataset (loads + trains)
+budget: ai2/robotics
+tasks:
+- name: smoke-blocksuite
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=pyav   # dataset videos are AV1; PyAV bundles an AV1-capable ffmpeg
+    export STABLEWM_HOME=/results
+    export PYTHONUNBUFFERED=1
+
+    # Verify the fixed Blocksuite dataset (config/train/data/blocksuite_drop.yaml ->
+    # root /weka/robots/aguru/datasets/blocksuite_drop_v0_fixed, built by
+    # scripts/fix_blocksuite_dataset.py): it should LOAD (videos found via the symlinked
+    # reader-layout), train a few steps (action.policy->action alias gives the 45-dim action
+    # encoder input), and run a full validation (NO limit_val_batches) so the WM-error
+    # callback logs videos on this dataset too. Small data (500 eps / 32k frames), so 2 epochs
+    # is cheap; window_size=8 ensures enough windows form on the val episodes.
+    uv run --frozen --no-sync train.py \
+      data=blocksuite_drop \
+      trainer.devices=1 \
+      trainer.max_epochs=2 \
+      +trainer.limit_train_batches=15 \
+      subdir=blocksuite_smoke \
+      output_model_name=lewm_blocksuite_smoke \
+      num_workers=4 \
+      loader.batch_size=64 \
+      wm_error_logging.window_size=8 \
+      wm_error_logging.num_videos=5 \
+      wandb.enabled=false
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  resources:
+    gpuCount: 1
+    sharedMemory: 64GiB
+  context:
+    priority: high
+    preemptible: true
+  constraints:
+    cluster: [ai2/neptune, ai2/titan]
+  hostNetworking: true

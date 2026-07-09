@@ -1,0 +1,24 @@
+# Blocksuite-Drop-v0 dataset (LeRobot v3.0, franka, 25fps, 360x640, AV1 video).
+#
+# The RAW dataset is not directly loadable: its video files use a non-standard layout
+# (videos/chunk-NNN/<key>/episode_NNNNNN.mp4, ':' -> '_') and its meta/episodes is missing
+# the videos/<key>/{chunk_index,file_index,from/to_timestamp} columns lerobot>=0.5 needs.
+# scripts/fix_blocksuite_dataset.py builds the reader-compatible `root` below (per-file
+# symlinks in the expected layout + backfilled columns; data/ is already valid v3.0).
+#
+# Schema vs the TAMP configs:
+#   - primary camera is `observation.images.camera:drop_camera` (not front_camera)
+#   - there is NO canonical `action`; the 9-dim policy action is `action.policy`, mapped to
+#     the swm `action` key via key_aliases (proprio = observation.state[8] is a default alias)
+#   - same dims as TAMP: action 9 -> action_encoder input 45, proprio 8.
+# Select with: `uv run train.py data=blocksuite_drop ...`
+dataset:
+  num_steps: ${eval:'${num_preds} + ${history_size}'}   # = 4
+  frameskip: 5                                           # 25fps -> 5fps effective; window spans 20 raw frames
+  name: "lerobot://blocksuite-drop-v0"
+  root: /weka/robots/aguru/datasets/blocksuite_drop_v0_fixed
+  primary_camera_key: "observation.images.camera:drop_camera"
+  key_aliases:
+    "action.policy": action
+  keys_to_load:  [pixels, action, proprio]
+  keys_to_cache: [action, proprio]

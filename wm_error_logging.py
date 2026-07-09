@@ -36,6 +36,10 @@ from stable_pretraining import data as spt_data
 log = logging.getLogger("wm_error_logging")
 
 
+def _fmt(v):
+    return "n/a" if v is None else f"{v:.3f}"
+
+
 def _imagenet_mean_std(device):
     stats = spt_data.dataset_stats.ImageNet
     mean = torch.as_tensor(stats["mean"], dtype=torch.float32, device=device).view(-1, 1, 1)
@@ -52,24 +56,77 @@ def _unnormalize_to_uint8(clip):
 
 
 def _gather_records(buf, world_size):
-    """buf: list of (row_id_tensor_cpu, err_tensor_cpu). Returns (row_ids, errs) np arrays,
-    all-gathered across ranks and deduplicated by row id."""
+    """buf: list of (row_id, err, landed, norm_err) cpu tensors. Returns
+    (row_ids, errs, landed, norm_err) np arrays, all-gathered across ranks and deduplicated by
+    row id. `landed` is the input-frame block-fallen flag (NaN if the dataset has no `landed`
+    column); `norm_err` is the persistence-relative error (NaN if unavailable)."""
+    def _col(i, default_nan=True):
+        if buf and len(buf[0]) > i:
+            return torch.cat([t[i] for t in buf]).to(torch.float64).numpy()
+        return np.full(len(row_ids), np.nan) if default_nan else None
+
     if buf:
-        row_ids = torch.cat([r for r, _ in buf]).to(torch.int64).numpy()
-        errs = torch.cat([e for _, e in buf]).to(torch.float64).numpy()
+        row_ids = torch.cat([t[0] for t in buf]).to(torch.int64).numpy()
+        errs = torch.cat([t[1] for t in buf]).to(torch.float64).numpy()
+        landed = _col(2)
+        norm_err = _col(3)
     else:
         row_ids = np.empty(0, dtype=np.int64)
         errs = np.empty(0, dtype=np.float64)
+        landed = np.empty(0, dtype=np.float64)
+        norm_err = np.empty(0, dtype=np.float64)
 
     if world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
         gathered = [None] * world_size
-        torch.distributed.all_gather_object(gathered, (row_ids, errs))
-        row_ids = np.concatenate([g[0] for g in gathered]) if gathered else row_ids
-        errs = np.concatenate([g[1] for g in gathered]) if gathered else errs
+        torch.distributed.all_gather_object(gathered, (row_ids, errs, landed, norm_err))
+        row_ids = np.concatenate([g[0] for g in gathered])
+        errs = np.concatenate([g[1] for g in gathered])
+        landed = np.concatenate([g[2] for g in gathered])
+        norm_err = np.concatenate([g[3] for g in gathered])
 
     # DistributedSampler can repeat rows to pad the last batch; keep first occurrence.
     _, uniq = np.unique(row_ids, return_index=True)
-    return row_ids[uniq], errs[uniq]
+    return row_ids[uniq], errs[uniq], landed[uniq], norm_err[uniq]
+
+
+def _stacked_decile_hist(values, fallen, xlabel, title):
+    """Stacked bar over 10% percentile buckets (deciles) of `values`: green = block not yet
+    fallen (bottom), red = block fallen (top). `values`/`fallen` are aligned per-sample arrays
+    (`fallen` is 0/1). Returns a wandb.Image, or None if matplotlib is unavailable / no data."""
+    values = np.asarray(values, dtype=np.float64)
+    fallen = np.asarray(fallen) > 0.5
+    n = len(values)
+    if n == 0:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[wm_error] matplotlib/wandb unavailable for landed histogram (%s)", exc)
+        return None
+
+    order = np.argsort(values, kind="stable")
+    decile = (np.arange(n) * 10) // n               # 0..9, equal-count buckets in sorted order
+    fallen_sorted = fallen[order]
+    green = np.array([(~fallen_sorted[decile == d]).sum() for d in range(10)])  # not fallen
+    red = np.array([(fallen_sorted[decile == d]).sum() for d in range(10)])     # fallen
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    x = np.arange(10)
+    ax.bar(x, green, color="green", label="block not yet fallen")
+    ax.bar(x, red, bottom=green, color="red", label="block fallen")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{d*10}-{d*10+10}" for d in range(10)], rotation=45, fontsize=8)
+    ax.set_xlabel(f"{xlabel} percentile (%)")
+    ax.set_ylabel("# validation samples")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
 
 
 class WMErrorVideoCallback(Callback):
@@ -102,6 +159,9 @@ class WMErrorVideoCallback(Callback):
         # used to compute the per-window change (error reduction) between eval intervals.
         # Windows are fixed across intervals, so window_index is a stable key.
         self._prev_win_err = None
+        # Previous interval's PER-SAMPLE error ({row_id -> error}), for the per-sample
+        # rate-of-change landed histogram.
+        self._prev_err_by_row = None
 
         # Precompute the windows once: group the (temporally ordered) val rows by episode,
         # then tile windows of `window_size` consecutive rows with the given stride. Windows
@@ -148,7 +208,7 @@ class WMErrorVideoCallback(Callback):
         if not self._active(trainer):
             return
         buf = getattr(pl_module, "_wm_err_buf", [])
-        row_ids, errs = _gather_records(buf, trainer.world_size)
+        row_ids, errs, landed, norm_err = _gather_records(buf, trainer.world_size)
 
         if not trainer.is_global_zero:
             return
@@ -165,6 +225,26 @@ class WMErrorVideoCallback(Callback):
             return
 
         err_by_row = dict(zip(row_ids.tolist(), errs.tolist()))
+        landed_by_row = dict(zip(row_ids.tolist(), landed.tolist()))
+        # Persistence-relative normalized error (see train.py): computed once over the full
+        # gathered val set on rank 0. We report the MEDIAN (not the mean): the per-sample ratio
+        # has a heavy right tail (near-static / landed samples have tiny denominators -> huge
+        # ratios), so a mean is dominated by outliers; the median is the robust typical value
+        # and needs no cap. Split by the input-frame block state (`landed`).
+        norm_arr = np.asarray(norm_err, dtype=np.float64)
+        landed_arr = np.asarray(landed, dtype=np.float64)
+        norm_curves = {}
+        finite = np.isfinite(norm_arr)
+        if finite.any():
+            vals = norm_arr[finite]
+            lnd = landed_arr[finite]
+            norm_curves["validate/normalized_error"] = float(np.median(vals))
+            falling = vals[lnd == 0.0]   # block not yet fallen
+            fallen = vals[lnd == 1.0]    # block fallen + rolling
+            if falling.size:
+                norm_curves["validate/normalized_error/falling"] = float(np.median(falling))
+            if fallen.size:
+                norm_curves["validate/normalized_error/fallen_rolling"] = float(np.median(fallen))
 
         # Accumulate per-sample error per (precomputed, fixed) window. Skip windows missing
         # any row (shouldn't happen on a full val pass). curr: {window_index -> error}.
@@ -212,6 +292,35 @@ class WMErrorVideoCallback(Callback):
         if deltas is not None:
             media["validate/wm_error_change/delta_hist"] = wandb.Histogram(deltas.tolist())
 
+        # Normalized (persistence-relative) error curves: overall + per landed-class time series.
+        media.update(norm_curves)
+        if norm_curves:
+            log.info("[wm_error] epoch %d normalized_error(median): all=%.3f falling=%s fallen_rolling=%s",
+                     trainer.current_epoch, norm_curves.get("validate/normalized_error", float("nan")),
+                     _fmt(norm_curves.get("validate/normalized_error/falling")),
+                     _fmt(norm_curves.get("validate/normalized_error/fallen_rolling")))
+
+        # ---- Per-sample landed-vs-not decile histograms (block fallen at the input frame) ----
+        # Only for samples whose `landed` is known (not NaN). Bucket samples into deciles of a
+        # per-sample metric and stack green (not yet fallen) / red (fallen) within each.
+        known = [r for r in err_by_row if not np.isnan(landed_by_row.get(r, np.nan))]
+        if known:
+            err_vals = [err_by_row[r] for r in known]
+            err_fallen = [landed_by_row[r] for r in known]
+            img = _stacked_decile_hist(err_vals, err_fallen, "WM error", "Block fallen vs WM-error percentile")
+            if img is not None:
+                media["validate/wm_error/landed_by_error_pct"] = img
+            # rate of change vs previous interval (per sample), if available
+            if self._prev_err_by_row:
+                ch = [r for r in known if r in self._prev_err_by_row]
+                if ch:
+                    ch_vals = [self._prev_err_by_row[r] - err_by_row[r] for r in ch]
+                    ch_fallen = [landed_by_row[r] for r in ch]
+                    img2 = _stacked_decile_hist(
+                        ch_vals, ch_fallen, "WM error change", "Block fallen vs WM-error-change percentile")
+                    if img2 is not None:
+                        media["validate/wm_error_change/landed_by_change_pct"] = img2
+
         try:
             for rank, wi in enumerate(high_sel):
                 media[f"validate/wm_error/high/{rank}"] = self._render_video(
@@ -245,8 +354,9 @@ class WMErrorVideoCallback(Callback):
             win_err.min(), win_err.max(),
         )
 
-        # Remember this interval's per-window errors for next interval's change metric.
+        # Remember this interval's per-window AND per-sample errors for next interval's change.
         self._prev_win_err = curr
+        self._prev_err_by_row = dict(err_by_row)
 
     # -- video construction --------------------------------------------------------------
 

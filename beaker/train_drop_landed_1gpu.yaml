@@ -1,0 +1,74 @@
+version: v2
+description: le-wm LeWM train on Blocksuite-Drop (landed) dataset (1 GPU / neptune L40S, wandb + landed histograms + block-pose linear probe)
+budget: ai2/robotics
+tasks:
+- name: train-drop-landed-1gpu
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+    # moviepy: encode wandb.Video clips. matplotlib: render the stacked landed-vs-not decile
+    # histograms as wandb.Image. (matplotlib is usually already in the locked env; install is
+    # idempotent insurance.)
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg matplotlib
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=pyav   # drop dataset videos are AV1; PyAV bundles an AV1-capable ffmpeg
+    export STABLEWM_HOME=/weka/robots/aguru/le-wm/.runs
+    export SPT_CACHE_DIR=/weka/robots/aguru/le-wm/.runs/spt
+    export PYTHONUNBUFFERED=1
+
+    # Train on the FIXED Blocksuite-Drop dataset that has the per-timestep `landed` bool
+    # (config/train/data/blocksuite_drop_landed.yaml -> root blocksuite_drop_landed_fixed).
+    # Each validation logs, in addition to the per-window video buckets + window_size=8 clips:
+    #   validate/wm_error/landed_by_error_pct          (stacked green=not-fallen / red=fallen
+    #                                                   over deciles of per-sample WM error)
+    #   validate/wm_error_change/landed_by_change_pct  (same, over deciles of per-sample error
+    #                                                   change vs the previous interval; epoch>=1)
+    uv run --frozen --no-sync train.py \
+      data=blocksuite_drop_landed \
+      trainer.devices=1 \
+      subdir=drop_landed_probe \
+      output_model_name=lewm_drop_landed_probe \
+      num_workers=8 \
+      loader.batch_size=128 \
+      optimizer.lr=1e-4 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-drop
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  - name: PYTORCH_ALLOC_CONF
+    value: expandable_segments:True
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 1
+    sharedMemory: 64GiB
+  context:
+    priority: urgent
+    preemptible: false
+  constraints:
+    cluster: [ai2/neptune]
+  hostNetworking: true

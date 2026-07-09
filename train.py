@@ -23,6 +23,7 @@ from utils import (
     SaveCkptCallback,
 )
 from wm_error_logging import WMErrorVideoCallback
+from probe_logging import ProbeCallback
 
 log = logging.getLogger("train.setup")
 
@@ -73,9 +74,40 @@ def lejepa_forward(self, batch, stage, cfg):
     # NB: spt.Module.validation_step calls forward(batch, stage="validate") (not "val").
     if stage == "validate" and "row_id" in batch:
         err = (pred_emb - tgt_emb).pow(2).mean(dim=(1, 2)).detach().cpu()  # (B,)
+        # Normalized (persistence-relative) error per sample:
+        #   ||pred - s_{t+1}|| / ||s_t - s_{t+1}||  aggregated over the 1-step transitions.
+        # The denominator is exactly the error of predicting "no state change" (s_t == ctx_emb
+        # is the most-recent context frame), so =1 means no better than persistence, <<1 means
+        # the world model captures the dynamics, >1 means worse. Requires ctx_emb/tgt_emb to
+        # align 1:1 (true for num_preds=1). See wm_error_logging for the logged curves.
+        if ctx_emb.shape[1] == tgt_emb.shape[1]:
+            num = (pred_emb - tgt_emb).norm(dim=-1).sum(dim=1)  # (B,)
+            den = (ctx_emb - tgt_emb).norm(dim=-1).sum(dim=1)   # (B,)
+            norm_err = (num / (den + 1e-6)).detach().cpu()
+        else:
+            norm_err = torch.full_like(err, float("nan"))
+        # `landed` of the input state (frame 0) per sample, for the val landed-vs-not
+        # histograms + the per-class normalized-error curves; NaN when the dataset has no
+        # `landed` column (older datasets).
+        if "landed" in batch:
+            landed = batch["landed"][:, 0].reshape(err.shape[0]).float().detach().cpu()
+        else:
+            landed = torch.full_like(err, float("nan"))
         if not hasattr(self, "_wm_err_buf"):
             self._wm_err_buf = []
-        self._wm_err_buf.append((batch["row_id"].detach().cpu(), err))
+        self._wm_err_buf.append((batch["row_id"].detach().cpu(), err, landed, norm_err))
+
+        # Linear-probe buffer: latent of the "current state" s (last context frame, index
+        # ctx_len-1) paired with the block pose at that same frame. ProbeCallback fits a ridge
+        # map latent -> z / quaternion on a fixed val-episode split each epoch. Only when the
+        # dataset carries block_pose (the landed build). fp16 latent keeps the buffer tiny.
+        if "block_pose" in batch:
+            s = ctx_len - 1
+            lat = emb[:, s].detach().cpu().to(torch.float16)          # (B, D)
+            pose = batch["block_pose"][:, s].detach().cpu().float()   # (B, 7)
+            if not hasattr(self, "_probe_buf"):
+                self._probe_buf = []
+            self._probe_buf.append((batch["row_id"].detach().cpu(), lat, pose))
     return output
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
@@ -98,6 +130,8 @@ def run(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
+            if col in ("landed", "block_pose", "block_velocity"):
+                continue  # val-analysis columns (landed flag, probe targets): keep raw, do NOT z-score
             with step(f"get_column_normalizer({col})"):
                 normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
@@ -180,6 +214,18 @@ def run(cfg):
                 ep=row_ep,
                 step=row_step,
                 **{k: v for k, v in wm_err_cfg.items() if k != "enabled"},
+                enabled=True,
+            )
+        )
+
+    probe_cfg = OmegaConf.to_container(cfg.get("probe_logging", {}) or {}, resolve=True)
+    if probe_cfg.get("enabled", False):
+        callbacks.append(
+            ProbeCallback(
+                val_rows=val_rows,
+                ep=row_ep,
+                seed=cfg.seed,
+                **{k: v for k, v in probe_cfg.items() if k != "enabled"},
                 enabled=True,
             )
         )

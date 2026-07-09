@@ -1,0 +1,74 @@
+version: v2
+description: le-wm LeWM train on full Blocksuite-Drop-v0 dataset (1 GPU / neptune L40S, wandb + WM-error videos)
+budget: ai2/robotics
+tasks:
+- name: train-drop-1gpu
+  replicas: 1
+  image:
+    beaker: arjung/mlsoc
+  command: ['/bin/bash', '-c']
+  arguments:
+  - |-
+    set -euo pipefail
+    nvidia-smi
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export UV_PROJECT_ENVIRONMENT=/root/le-wm-venv
+    export UV_CACHE_DIR=/root/uv-cache
+    cd /weka/robots/aguru/le-wm
+    uv sync --frozen
+    # WMErrorVideoCallback logs wandb.Video clips at each validation; wandb.Video(numpy) needs
+    # moviepy to encode mp4s (pinned <2 for wandb 0.24's moviepy.editor import).
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT" 'moviepy<2' imageio-ffmpeg
+
+    export HF_HUB_OFFLINE=1
+    export LEROBOT_VIDEO_BACKEND=pyav   # drop dataset videos are AV1; PyAV bundles an AV1-capable ffmpeg
+    # Persist checkpoints + resumable state to weka so they survive the job.
+    export STABLEWM_HOME=/weka/robots/aguru/le-wm/.runs
+    export SPT_CACHE_DIR=/weka/robots/aguru/le-wm/.runs/spt
+    export PYTHONUNBUFFERED=1
+
+    # Full training on the FIXED Blocksuite-Drop dataset (config/train/data/blocksuite_drop.yaml ->
+    # root /weka/robots/aguru/datasets/blocksuite_drop_v0_fixed). wandb ON, so the validation
+    # WM-error logging is active with its config defaults (enabled, window_size=16, num_videos=10):
+    # validation runs every epoch (small dataset -> ~80 steps/epoch), and each validation logs
+    #   validate/wm_error/{high,low}/*                 (worst/best-predicted windows)
+    #   validate/wm_error_change/{most_reduced,least_reduced}/*  (improvement vs previous interval)
+    # plus the histograms, alongside the scalar validate/pred_loss.
+    uv run --frozen --no-sync train.py \
+      data=blocksuite_drop \
+      trainer.devices=1 \
+      subdir=drop_full_1gpu \
+      output_model_name=lewm_drop_full \
+      num_workers=8 \
+      loader.batch_size=128 \
+      optimizer.lr=1e-4 \
+      wandb.enabled=true \
+      wandb.config.entity=prior-ai2 \
+      wandb.config.project=le-wm-drop
+  datasets:
+  - mountPath: /weka/robots
+    source:
+      weka: robots-default
+  result:
+    path: /results
+  envVars:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: NCCL_SOCKET_IFNAME
+    value: bond0
+  - name: NVIDIA_DRIVER_CAPABILITIES
+    value: compute,utility,video
+  - name: PYTORCH_ALLOC_CONF          # reduce fragmentation on the ~44GiB L40S
+    value: expandable_segments:True
+  - name: WANDB_API_KEY
+    secret: ARJUNG_WANDB_API_KEY
+  resources:
+    gpuCount: 1
+    sharedMemory: 64GiB
+  context:
+    priority: urgent
+    preemptible: false   # real training run; don't preempt
+  constraints:
+    cluster: [ai2/neptune]
+  hostNetworking: true

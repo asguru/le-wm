@@ -48,9 +48,20 @@ loss:
 # the worst/best windows to wandb each eval interval. See wm_error_logging.py.
 wm_error_logging:
   enabled: true
-  window_size: 16
-  stride: 16                 # non-overlapping; set < window_size for an overlapping slide
+  window_size: 8
+  stride: 8                  # non-overlapping; set < window_size for an overlapping slide
   num_videos: 10             # per bucket (high-error and low-error)
   fps: 4
   eval_every_n_epochs: null  # null = run on every validation epoch
   frame_select: first        # which frame of each data point to show (first|last)
+
+# Linear-probe decodability of block pose from the WM latent (validation only; needs a dataset
+# with the block_pose column, e.g. data=blocksuite_drop_landed). Each val epoch fits a ridge map
+# latent -> z / quaternion on a FIXED val-episode split and logs held-out R^2. See probe_logging.py.
+probe_logging:
+  enabled: true
+  eval_split: 0.3            # fraction of val EPISODES held out (fixed for the whole run) for probe R^2
+  ridge_lambda: 1.0          # SCALE-FREE ridge: penalty = lambda * mean feature energy (~lambda*N).
+                             # ~1 = shrinkage comparable to signal; needed because temporally
+                             # correlated frames -> few independent samples -> OLS overfits.
+  eval_every_n_epochs: null  # null = run on every validation epoch
